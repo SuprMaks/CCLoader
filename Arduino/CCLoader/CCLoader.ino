@@ -19,6 +19,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 * DEFINES
 */
 // Start addresses on DUP (Increased buffer size improves performance)
+
 #define ADDR_BUF0                   0x0000 // Buffer (512 bytes)
 #define ADDR_DMA_DESC_0             0x0200 // DMA descriptors (8 bytes)
 #define ADDR_DMA_DESC_1             (ADDR_DMA_DESC_0 + 8)
@@ -76,6 +77,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 // Commands to Bootloader
 #define SBEGIN                0x01
+#define RBEGIN                0b1010101
 #define SDATA                 0x02
 #define SRSP                  0x03
 #define SEND                  0x04
@@ -231,10 +233,7 @@ unsigned char debug_command(unsigned char cmd, unsigned char *cmd_bytes,
 *           ProgrammerInit().
 * @return   None.
 ******************************************************************************/
-void debug_init(void)
-{
-    volatile unsigned char i;
-
+void debug_init(void){
     // Send two flanks on DC while keeping RESET_N low
     // All low (incl. RESET_N)
     digitalWrite(DD, LOW);
@@ -495,8 +494,6 @@ void write_flash_memory_block(unsigned char *src, unsigned long start_addr,
 
 void RunDUP(void)
 {
-  volatile unsigned char i;
-
   // Send two flanks on DC while keeping RESET_N low
   // All low (incl. RESET_N)
   digitalWrite(DD, LOW);
@@ -506,6 +503,18 @@ void RunDUP(void)
 
   digitalWrite(RESET, HIGH);
   delay(10);   // Wait
+}
+
+String code_int(int a){
+  return "0x" + String(a, HEX) + "(" + String(a, BIN) + ")";
+}
+
+void Hex5print(uint32_t data){
+  char tmp[4];
+  sprintf(tmp, "%.1X", (uint16_t)(data >> 16)); 
+  Serial.print(tmp);
+  sprintf(tmp, "%.4X", (uint16_t)(data & 0xFFFFu)); 
+  Serial.print(tmp);
 }
 
 void ProgrammerInit(void)
@@ -529,26 +538,26 @@ void setup()
   while(!Serial);
 }
 
-void loop() 
-{
+void loop(){
   unsigned char chip_id = 0;
   unsigned char debug_config = 0;
   unsigned char Continue = 0;
   unsigned char Verify = 0;
   
-  while(!Continue)     // Wait for starting
-  {  
-    
-    if(Serial.available()==2)
-    {      
-      if(Serial.read() == SBEGIN)
-      {
+  while(!Continue){  
+    if(Serial.available()==2){      
+      if(Serial.read() == SBEGIN){
         Verify = Serial.read();
-        Continue = 1;
+        Continue = SBEGIN;
       }
-      else
-      {
-        Serial.read(); // Clear RX buffer
+      else if (Serial.read() == RBEGIN) {
+        Serial.read();
+        Continue = RBEGIN;
+      }
+      else{
+        while (Serial.available() > 0) {
+          Serial.read(); // Clear RX buffer
+        }
       }
     }
   }
@@ -560,107 +569,154 @@ void loop()
     Serial.write(ERRO);  
     return; // No chip detected, run loop again.
   }
-  
-  RunDUP();
-  debug_init();
-  
-  chip_erase();
-  RunDUP();
-  debug_init();
-  
-  // Switch DUP to external crystal osc. (XOSC) and wait for it to be stable.
-  // This is recommended if XOSC is available during programming. If
-  // XOSC is not available, comment out these two lines.
-  write_xdata_memory(DUP_CLKCONCMD, 0x80);
-  while (read_xdata_memory(DUP_CLKCONSTA) != 0x80);//0x80)
-  
-  // Enable DMA (Disable DMA_PAUSE bit in debug configuration)
-  debug_config = 0x22;
-  debug_command(CMD_WR_CONFIG, &debug_config, 1);
-  
-  // Program data (start address must be word aligned [32 bit])
-  Serial.write(SRSP);    // Request data blocks
-  digitalWrite(LED, HIGH);  
-  unsigned char Done = 0;
-  unsigned char State = WAITING;
-  unsigned char  rxBuf[514]; 
-  unsigned int BufIndex = 0;
-  unsigned int addr = 0x0000;
-  while(!Done)
-  {
-    while(Serial.available())
+
+  if (Continue == SBEGIN) {
+    RunDUP();
+    debug_init();
+    
+    chip_erase();
+    RunDUP();
+    debug_init();
+    
+    // Switch DUP to external crystal osc. (XOSC) and wait for it to be stable.
+    // This is recommended if XOSC is available during programming. If
+    // XOSC is not available, comment out these two lines.
+    write_xdata_memory(DUP_CLKCONCMD, 0x80);
+    while (read_xdata_memory(DUP_CLKCONSTA) != 0x80);//0x80)
+    
+    // Enable DMA (Disable DMA_PAUSE bit in debug configuration)
+    debug_config = 0x22;
+    debug_command(CMD_WR_CONFIG, &debug_config, 1);
+    
+    // Program data (start address must be word aligned [32 bit])
+    Serial.write(SRSP);    // Request data blocks
+    digitalWrite(LED, HIGH);  
+    unsigned char Done = 0;
+    unsigned char State = WAITING;
+    unsigned char  rxBuf[514]; 
+    unsigned int BufIndex = 0;
+    uint16_t addr = 0x0;
+    while(!Done)
     {
-      unsigned char ch;    
-      ch = Serial.read();        
-      switch (State)
+      while(Serial.available())
       {
-        // Bootloader is waiting for a new block, each block begin with a flag byte
-        case WAITING:
+        unsigned char ch;    
+        ch = Serial.read();        
+        switch (State)
         {
-          if(SDATA == ch)  // Incoming bytes are data
+          // Bootloader is waiting for a new block, each block begin with a flag byte
+          case WAITING:
           {
-            State = RECEIVING;
-          }
-          else if(SEND == ch)   // End receiving firmware
-          {
-            Done = 1;           // Exit while(1) in main function
-          }
-          break;
-        }      
-        // Bootloader is receiving block data  
-        case RECEIVING:
-        {          
-          rxBuf[BufIndex] = ch;
-          BufIndex++;            
-          if (BufIndex == 514) // If received one block, write it to flash
-          {
-            BufIndex = 0;              
-            uint16_t CheckSum = 0x0000;
-            for(unsigned int i=0; i<512; i++)
+            if(SDATA == ch)  // Incoming bytes are data
             {
-              CheckSum += rxBuf[i];
+              State = RECEIVING;
             }
-            uint16_t CheckSum_t = rxBuf[512]<<8 | rxBuf[513];
-            if(CheckSum_t != CheckSum)
+            else if(SEND == ch)   // End receiving firmware
             {
-              State = WAITING;
-              Serial.write(ERRO);                    
-              chip_erase();
-              return;
-            } 
-            write_flash_memory_block(rxBuf, addr, 512); // src, address, count                    
-            if(Verify)
+              Done = 1;           // Exit while(1) in main function
+            }
+            break;
+          }      
+          // Bootloader is receiving block data  
+          case RECEIVING:
+          {          
+            rxBuf[BufIndex] = ch;
+            BufIndex++;            
+            if (BufIndex == 514) // If received one block, write it to flash
             {
-              unsigned char bank = addr / (512 * 16);
-              unsigned int  offset = (addr % (512 * 16)) * 4;
-              unsigned char read_data[512];
-              read_flash_memory_block(bank, offset, 512, read_data); // Bank, address, count, dest.            
-              for(unsigned int i = 0; i < 512; i++) 
+              BufIndex = 0;              
+              uint16_t CheckSum = 0x0000;
+              for(unsigned int i=0; i<512u; i++)
               {
-                if(read_data[i] != rxBuf[i]) 
+                CheckSum += rxBuf[i];
+              }
+              uint16_t CheckSum_t = rxBuf[512]<<8 | rxBuf[513];
+              if(CheckSum_t != CheckSum)
+              {
+                State = WAITING;
+                Serial.write(ERRO);                    
+                chip_erase();
+                return;
+              } 
+              write_flash_memory_block(rxBuf, addr, 512); // src, address, count                    
+              if(Verify)
+              {
+                unsigned char bank = addr / (512u * 16);
+                unsigned int  offset = (addr % (512u * 16)) * 4;
+                unsigned char read_data[512u];
+                read_flash_memory_block(bank, offset, 512u, read_data); // Bank, address, count, dest.            
+                for(unsigned int i = 0; i < 512u; i++) 
                 {
-                  // Fail
-                  State = WAITING;
-                  Serial.write(ERRO);                    
-                  chip_erase();
-                  return;
+                  if(read_data[i] != rxBuf[i]) 
+                  {
+                    // Fail
+                    State = WAITING;
+                    Serial.write(ERRO);                    
+                    chip_erase();
+                    return;
+                  }
                 }
               }
+              addr += 128u;              
+              State = WAITING;
+              Serial.write(SRSP);
             }
-            addr += (unsigned int)128;              
-            State = WAITING;
-            Serial.write(SRSP);
-          }
-          break;
-        }      
-        default:
-          break;
+            break;
+          }      
+          default:
+            break;
+        }
       }
+    }
+    
+    digitalWrite(LED, LOW);
+    RunDUP();
+  }
+  else if (Continue == RBEGIN) {
+    Serial.println("chip_id: " + code_int(chip_id)); // выводим chip_id в терминал
+    Serial.println();
+ 
+    Serial.println("CHIPINFO0: " + code_int(read_xdata_memory(0x6276)));
+    Serial.println("CHIPINFO1: " + code_int(read_xdata_memory(0x6277)));
+    Serial.println();
+    
+    Serial.println("READING FLASH offset: hex");
+    
+    uint16_t addr = 0x0; // начинаем читать прошивку с 0 адреса
+    //int next = 1;
+    // && next
+    char tmp[2];
+    while (addr <= (uint16_t)511u * 128u) // крутимпся до тех пор пока не прочитали все 512 блоков и до тех пор пока идет команда NEXT
+    { // берем окно в 512 байт и посылаем команду на чтение блока прошивки
+      unsigned char bank = addr / (512u * 16);
+      unsigned int offset = (addr % (512u * 16)) * 4;
+      unsigned char read_data[512u];
+      
+      read_flash_memory_block(bank, offset, 512u, read_data); // Bank,addr,count,dest
+  
+      //for(unsigned int i = 0; i < 512; i++) // проходим по каждому байту полученных данных и выводим отдельной строчкой в терминал
+      //{
+      //  Serial.println(String(addr * 4 + i, HEX) + ": " + String(read_data[i], HEX) + " :: " + String(read_data[i]));
+      //}
+
+      for(uint16_t l = 0; l < 512u; l += 16) {
+        Hex5print(addr * 4 + l);
+        Serial.print(": ");
+        
+        for (uint8_t i = 0; i < 16; i++) { 
+          sprintf(tmp, "%.2X", read_data[l + i]); 
+          Serial.print(tmp); Serial.print(' ');
+        }
+
+        Serial.println();
+      }
+  
+      addr += 128u; // сдвигаем окно считывания прошивки
+  
+      //while (!Serial.available()) { } // Ждем команду NEXT
+      //Serial.read();
     }
   }
   
-  digitalWrite(LED, LOW);
-  RunDUP();
+  Continue = 0;
 }
-
-
